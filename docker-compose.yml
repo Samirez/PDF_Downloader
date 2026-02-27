@@ -1,0 +1,53 @@
+services:
+  hive-server:
+    image: bde2020/hive:latest
+    container_name: hive-server
+    ports:
+      - "10000:10000"
+      - "9083:9083"
+    environment:
+      SERVICE_NAME: hiveserver2
+      HIVE_CUSTOM_CONF_DIR: /hive/conf
+      CORE_CONF_fs_defaultFS: "file:///"
+      HIVE_CONF_javax_jdo_option_ConnectionDriverName: "org.apache.derby.jdbc.EmbeddedDriver"
+    restart: unless-stopped
+    networks:
+      - hive-net
+    volumes:
+      - hive-data:/user/hive/warehouse
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "10000"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  pyhive-client:
+    build: .
+    container_name: pyhive-client
+    depends_on:
+      hive-server:
+        condition: service_healthy
+    networks:
+      - hive-net
+    environment:
+      HIVE_HOST: hive-server
+      HIVE_PORT: 10000
+    restart: "no"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  hive-net:
+    driver: bridge
+
+volumes:
+  hive-data:

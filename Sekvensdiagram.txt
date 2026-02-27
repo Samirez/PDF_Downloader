@@ -1,0 +1,205 @@
+@startuml
+title PDF Downloader Pipeline - Sequence Diagram
+
+actor User
+participant Entrypoint as "entrypoint.sh"
+participant Downloader as "Downloader.py"
+participant FileDirectories as "FileDirectories.py"
+participant MetadataStorage as "metadata_storage.py"
+participant HiveStorage as "hive_pdf_storage.py"
+participant Excel as "Excel File\n(Data Source)"
+participant FileSystem as "File System"
+participant Hive as "Apache Hive"
+
+User -> Entrypoint: Execute pipeline
+activate Entrypoint
+
+Entrypoint -> Downloader: python Downloader.py
+activate Downloader
+
+Downloader -> Excel: Read URLs from Excel
+Excel -> Downloader: Return DataFrame with URLs
+
+Downloader -> Downloader: Iterate through rows
+loop For each URL in Excel
+    Downloader -> FileSystem: Check if file exists
+    alt File doesn't exist
+        Downloader -> Downloader: Validate primary URL\n(format & whitelist check)
+        alt Primary URL valid
+            Downloader -> Downloader: Try primary URL with requests
+            alt Primary download succeeds
+                Downloader -> FileSystem: Save PDF file
+                Downloader -> Downloader: Record download status (success)
+            else Primary download fails
+                Downloader -> Downloader: Validate fallback URL\n(format & whitelist check)
+                alt Fallback URL valid
+                    Downloader -> Downloader: Try fallback URL
+                    alt Fallback download succeeds
+                        Downloader -> FileSystem: Save PDF file
+                        Downloader -> Downloader: Record download status (success via fallback)
+                    else Fallback download fails
+                        Downloader -> Downloader: Log download failure\n(both primary & fallback failed)
+                        Downloader -> Downloader: Record failed download status
+                        alt Retry allowed
+                            Downloader -> Downloader: Schedule retry with backoff
+                            Downloader -> Downloader: Add to retry queue
+                        else Give up
+                            Downloader -> Downloader: Mark as permanently failed
+                        end
+                    end
+                else Fallback URL invalid
+                    Downloader -> Downloader: Log validation error for fallback
+                    Downloader -> Downloader: Record download status (validation failed)
+                end
+            end
+        else Primary URL invalid
+            Downloader -> Downloader: Log validation error\n(invalid format/not whitelisted)
+            Downloader -> Downloader: Record download status (validation failed)
+        end
+    else File exists
+        Downloader -> Downloader: Skip (already downloaded)
+    end
+end
+
+Downloader -> Entrypoint: Return download summary
+deactivate Downloader
+
+Entrypoint -> FileDirectories: python FileDirectories.py
+activate FileDirectories
+
+FileDirectories -> FileSystem: Scan pdf_output directory
+FileSystem -> FileDirectories: List all PDF files
+
+FileDirectories -> FileDirectories: Organize files into directory structure
+FileDirectories -> FileSystem: Create organized hierarchy
+deactivate FileDirectories
+
+Entrypoint -> MetadataStorage: python metadata_storage.py
+activate MetadataStorage
+
+MetadataStorage -> Excel: Read source Excel file
+MetadataStorage -> FileSystem: Get list of downloaded PDFs
+
+loop For each downloaded PDF
+    MetadataStorage -> FileSystem: Open PDF file
+    alt PDF readable
+        MetadataStorage -> MetadataStorage: Extract metadata using pypdf.PdfReader
+        MetadataStorage -> MetadataStorage: Get page count and status
+        MetadataStorage -> MetadataStorage: Update in-memory DataFrame with metadata
+    else PDF unreadable (corrupted/protected/unsupported)
+        MetadataStorage -> MetadataStorage: Catch exception (PdfReadError/etc)
+        MetadataStorage -> MetadataStorage: Log error details with file path
+        MetadataStorage -> MetadataStorage: Mark file as unreadable in record
+        MetadataStorage -> MetadataStorage: Set status = "ERROR" and note reason
+        MetadataStorage -> MetadataStorage: Update in-memory DataFrame with error status
+    end
+end
+
+note right of MetadataStorage
+  All updates (lines 83-95) modify an in-memory DataFrame.
+  No disk writes occur until the lock/serialize section below.
+end note
+
+MetadataStorage -> FileSystem: Acquire exclusive file lock\n(using filelock/portalocker)
+alt Lock acquired successfully
+    MetadataStorage -> FileSystem: Serialize in-memory DataFrame to temp Excel file
+    MetadataStorage -> FileSystem: Atomically replace original Excel file with temp
+    MetadataStorage -> FileSystem: Release file lock
+    MetadataStorage -> MetadataStorage: Log successful metadata write to disk
+    MetadataStorage -> Entrypoint: Return success status
+else Lock acquisition failed
+    MetadataStorage -> MetadataStorage: Retry with exponential backoff
+    alt Retry successful
+        MetadataStorage -> FileSystem: Serialize in-memory DataFrame to temp Excel file
+        MetadataStorage -> FileSystem: Atomically replace original Excel file with temp
+        MetadataStorage -> FileSystem: Release file lock
+        MetadataStorage -> MetadataStorage: Log successful update to disk after retry
+        MetadataStorage -> Entrypoint: Return success status
+    else All retries exhausted
+        MetadataStorage -> MetadataStorage: Log file lock error
+        MetadataStorage -> FileSystem: Save failed update to backup file
+        MetadataStorage -> Entrypoint: Return warning status (partial success)
+    end
+end
+
+deactivate MetadataStorage
+
+Entrypoint -> Entrypoint: Check MetadataStorage status
+alt Metadata update successful
+    Entrypoint -> HiveStorage: python hive_pdf_storage.py
+else Metadata update failed (warning)
+    note right of Entrypoint
+      Best-effort policy: Continue to Hive storage
+      despite metadata update failure.
+      Failed metadata saved to backup file.
+    end note
+    Entrypoint -> HiveStorage: python hive_pdf_storage.py
+activate HiveStorage
+
+HiveStorage -> FileSystem: Get output directory path
+FileSystem -> HiveStorage: Return path to PDFs
+
+HiveStorage -> Hive: Connect to Hive server\n(via PyHive)
+alt Connection successful
+    HiveStorage -> HiveStorage: Connection established
+else Connection failed
+    HiveStorage -> HiveStorage: Retry with exponential backoff
+    alt Retry successful
+        HiveStorage -> HiveStorage: Connection established after retry
+    else All retries exhausted
+        HiveStorage -> HiveStorage: Log connection error
+        HiveStorage -> FileSystem: Record failed files list
+        HiveStorage -> Entrypoint: Abort processing with error status
+        deactivate HiveStorage
+    end
+end
+
+activate Hive
+HiveStorage -> Hive: Create/update Hive table
+
+HiveStorage -> FileSystem: Read all PDFs
+loop For each PDF file
+    FileSystem -> HiveStorage: Provide file content
+    HiveStorage -> HiveStorage: Convert PDF to binary
+    HiveStorage -> Hive: Insert PDF blob + metadata
+    
+    alt Insert successful
+        Hive -> HiveStorage: Confirm insertion
+        alt Confirmation timeout
+            HiveStorage -> HiveStorage: Timeout waiting for confirmation
+            HiveStorage -> Hive: Attempt rollback
+            HiveStorage -> HiveStorage: Log timeout error
+            HiveStorage -> FileSystem: Record failed file
+        else Confirmation received
+            HiveStorage -> HiveStorage: Mark file as successfully stored
+        end
+    else Insert failed (transient error)
+        Hive -> HiveStorage: Network interruption/timeout
+        HiveStorage -> HiveStorage: Retry insert with backoff
+        alt Retry successful
+            Hive -> HiveStorage: Confirm insertion on retry
+            HiveStorage -> HiveStorage: Mark file as successfully stored
+        else Retry failed (permanent error)
+            HiveStorage -> HiveStorage: Log permanent failure
+            HiveStorage -> FileSystem: Record failed file
+            alt Policy: Continue
+                HiveStorage -> HiveStorage: Continue to next file
+            else Policy: Halt
+                HiveStorage -> Hive: Rollback transaction
+                deactivate Hive
+                HiveStorage -> Entrypoint: Abort with error status
+                deactivate HiveStorage
+            end        end
+    else Insert failed (permanent error)
+        Hive -> HiveStorage: Schema/constraint violation
+        HiveStorage -> HiveStorage: Log permanent error
+        HiveStorage -> FileSystem: Record failed file details
+        HiveStorage -> HiveStorage: Continue to next file
+    end
+end
+
+deactivate Hive
+deactivate HiveStorage
+Entrypoint -> User: Pipeline complete
+deactivate Entrypoint
+@enduml

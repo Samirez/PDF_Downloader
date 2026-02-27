@@ -1,0 +1,9 @@
+pyhive==0.6.5
+thrift==0.16.0
+thrift-sasl==0.4.3
+numpy==1.26.4
+pandas==2.0.3
+openpyxl==3.1.5
+pypdf==6.7.3
+requests==2.32.5
+shutil==0.1.0
